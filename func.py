@@ -118,8 +118,6 @@ def deduplicate(ts: DataFrame, time_col_name: str, data_col_name: str) -> DataFr
     logger.info("before dedup data count: " + str(ts.count()))
     report: DuplicateReport = DuplicateProcessor.detect_duplicates(ts=ts, time_col_name=time_col_name, data_col_name=data_col_name)
     # todo: Not none, but empty df
-    if report.duplicate_df is not None:
-        logger.info("duplicated record: " + report.duplicate_df.show())
     logger.info("duplicated record count: " + str(report.duplicate_df.count()) if report.duplicate_df is not None else 0)
     # todo: propagate report
     dedup_df = DuplicateProcessor.drop_duplicates(ts=ts)
