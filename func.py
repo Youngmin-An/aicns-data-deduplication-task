@@ -89,7 +89,7 @@ def load_validated_data(app_conf, time_col_name, data_col_name) -> DataFrame:
     :param data_col_name:
     :return:
     """
-    table_name = "validated_" + app_conf['FEATURE_ID']
+    table_name = "validated"
     # Inconsistent cache
     # https://stackoverflow.com/questions/63731085/you-can-explicitly-invalidate-the-cache-in-spark-by-running-refresh-table-table
     SparkSession.getActiveSession().sql(f"REFRESH TABLE {table_name}")
@@ -98,6 +98,7 @@ def load_validated_data(app_conf, time_col_name, data_col_name) -> DataFrame:
         FROM (
             SELECT {time_col_name}, {data_col_name}, concat(concat(cast(year as string), lpad(cast(month as string), 2, '0')), lpad(cast(day as string), 2, '0')) as date 
             FROM {table_name}
+            WHERE feature_id = {app_conf["FEATURE_ID"]}
             ) v 
         WHERE v.date  >= {app_conf['start'].format('YYYYMMDD')} AND v.date <= {app_conf['end'].format('YYYYMMDD')} 
     '''
@@ -125,12 +126,13 @@ def deduplicate(ts: DataFrame, time_col_name: str, data_col_name: str) -> DataFr
     return dedup_df
 
 
-def append_partition_cols(ts: DataFrame, time_col_name: str, data_col_name):
+def append_partition_cols(ts: DataFrame, feature_id: str, time_col_name: str, data_col_name):
     return (
         ts.withColumn("datetime", F.from_unixtime(F.col(time_col_name) / 1000))
         .select(
             time_col_name,
             data_col_name,
+            F.lit(feature_id).alias("feature_id"),
             F.year("datetime").alias("year"),
             F.month("datetime").alias("month"),
             F.dayofmonth("datetime").alias("day"),
@@ -152,19 +154,19 @@ def save_dedup_data_to_dwh(
     :return:
     """
     # todo: transaction
-    table_name = "cleaned_dup_" + app_conf["FEATURE_ID"]
+    table_name = "cleaned_deduplicated"
     SparkSession.getActiveSession().sql(
-        f"CREATE TABLE IF NOT EXISTS {table_name} ({time_col_name} BIGINT, {data_col_name} DOUBLE) PARTITIONED BY (year int, month int, day int) STORED AS PARQUET"
+        f"CREATE TABLE IF NOT EXISTS {table_name} ({time_col_name} BIGINT, {data_col_name} DOUBLE) PARTITIONED BY (feature_id CHAR(10), year int, month int, day int) STORED AS PARQUET"
     )
     period = pendulum.period(app_conf["start"], app_conf["end"])
 
     # Create partition columns(year, month, day) from timestamp
-    partition_df = append_partition_cols(ts, time_col_name, data_col_name)
+    partition_df = append_partition_cols(ts, app_conf["FEATURE_ID"], time_col_name, data_col_name)
 
     for date in period.range("days"):
         # Drop Partition for immutable task
         SparkSession.getActiveSession().sql(
-            f"ALTER TABLE {table_name} DROP IF EXISTS PARTITION(year={date.year}, month={date.month}, day={date.day})"
+            f"ALTER TABLE {table_name} DROP IF EXISTS PARTITION(feature_id={app_conf['FEATURE_ID']}, year={date.year}, month={date.month}, day={date.day})"
         )
     # Save
     partition_df.write.format("hive").mode("append").insertInto(table_name)
