@@ -48,11 +48,8 @@ def get_conf_from_evn():
         conf["SPARK_EXTRA_CONF_PATH"] = os.getenv(
             "SPARK_EXTRA_CONF_PATH", default=""
         )  # [AICNS-61]
-        conf["start"] = pendulum.parse(start_datetime).in_timezone(conf["APP_TIMEZONE"])
-        conf["end"] = pendulum.parse(end_datetime).in_timezone(conf["APP_TIMEZONE"])
-
-        # todo: temp patch for day resolution parsing, so later with [AICNS-59] resolution will be subdivided.
-        conf["end"] = conf["end"].subtract(minutes=1)
+        conf["start"] = pendulum.parse(start_datetime, tz=conf["APP_TIMEZONE"])
+        conf["end"] = pendulum.parse(end_datetime, tz=conf["APP_TIMEZONE"])
 
     except Exception as e:
         print(e)
@@ -94,14 +91,12 @@ def load_validated_data(app_conf, time_col_name, data_col_name) -> DataFrame:
     # https://stackoverflow.com/questions/63731085/you-can-explicitly-invalidate-the-cache-in-spark-by-running-refresh-table-table
     SparkSession.getActiveSession().sql(f"REFRESH TABLE {table_name}")
     query = f'''
-    SELECT v.{time_col_name}, v.{data_col_name}  
-        FROM (
-            SELECT {time_col_name}, {data_col_name}, concat(concat(cast(year as string), lpad(cast(month as string), 2, '0')), lpad(cast(day as string), 2, '0')) as date 
-            FROM {table_name}
-            WHERE feature_id = {app_conf["FEATURE_ID"]}
-            ) v 
-        WHERE v.date  >= {app_conf['start'].format('YYYYMMDD')} AND v.date <= {app_conf['end'].format('YYYYMMDD')} 
-    '''
+        SELECT {time_col_name}, {data_col_name}  
+            FROM  {table_name}
+                WHERE feature_id = {app_conf["FEATURE_ID"]} 
+                AND {time_col_name} >= {app_conf['start'].int_timestamp * 1000} 
+                AND {time_col_name} < {app_conf['end'].int_timestamp * 1000}
+        '''
     logger.info("load_validated_data query: " + query)
     ts = SparkSession.getActiveSession().sql(query)
     logger.info(ts.show())
@@ -126,9 +121,9 @@ def deduplicate(ts: DataFrame, time_col_name: str, data_col_name: str) -> DataFr
     return dedup_df
 
 
-def append_partition_cols(ts: DataFrame, feature_id: str, time_col_name: str, data_col_name):
-    return (
-        ts.withColumn("datetime", F.from_unixtime(F.col(time_col_name) / 1000))
+def append_partition_cols(ts: DataFrame, feature_id: str, time_col_name: str, data_col_name, tz):
+    SparkSession.getActiveSession().conf.set("spark.sql.session.timeZone", tz)
+    partitioned = ts.withColumn("datetime", F.from_unixtime(F.col(time_col_name) / 1000)) \
         .select(
             time_col_name,
             data_col_name,
@@ -136,9 +131,10 @@ def append_partition_cols(ts: DataFrame, feature_id: str, time_col_name: str, da
             F.year("datetime").alias("year"),
             F.month("datetime").alias("month"),
             F.dayofmonth("datetime").alias("day"),
-        )
+        ) \
         .sort(time_col_name)
-    )
+    SparkSession.getActiveSession().conf.unset("spark.sql.session.timeZone")
+    return partitioned
 
 
 def save_dedup_data_to_dwh(
@@ -158,10 +154,10 @@ def save_dedup_data_to_dwh(
     SparkSession.getActiveSession().sql(
         f"CREATE TABLE IF NOT EXISTS {table_name} ({time_col_name} BIGINT, {data_col_name} DOUBLE) PARTITIONED BY (feature_id CHAR(10), year int, month int, day int) STORED AS PARQUET"
     )
-    period = pendulum.period(app_conf["start"], app_conf["end"])
+    period = pendulum.period(app_conf["start"], app_conf["end"].subtract(days=1))
 
     # Create partition columns(year, month, day) from timestamp
-    partition_df = append_partition_cols(ts, app_conf["FEATURE_ID"], time_col_name, data_col_name)
+    partition_df = append_partition_cols(ts, app_conf["FEATURE_ID"], time_col_name, data_col_name, app_conf["APP_TIMEZONE"])
 
     for date in period.range("days"):
         # Drop Partition for immutable task
